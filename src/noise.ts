@@ -12,13 +12,9 @@ export const getNoiseFn = ({ resolution }: { resolution: number }) => {
      * returns a numeric value in the range [-1, 1] and we need to transform that into [-PI, PI] to offer
      * a full range of angles (in radians).
      *
-     * Finally, the X component is the cosine of the angle and the Y component is its sine
+     * The caller derives the vector from it: the X component is the cosine of the angle and the Y component
+     * is its sine. Returning the plain angle avoids allocating an object per particle and frame.
      */
-    const angle = randomFn(x * resolution, y * resolution, z * resolution) * Math.PI;
-
-    return {
-      x: Math.cos(angle),
-      y: Math.sin(angle),
-    };
+    return randomFn(x * resolution, y * resolution, z * resolution) * Math.PI;
   };
 };

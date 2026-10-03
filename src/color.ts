@@ -55,3 +55,21 @@ export const getGradient = (colorPalette: string) => {
       );
   }
 };
+
+/**
+ * Samples a gradient into a flat lookup table of `size` RGB triplets (values in [0, 1]).
+ * Evaluating chroma scales is expensive, so doing it once upfront instead of once per particle
+ * and frame removes the main bottleneck of the color update.
+ */
+export const createColorLUT = (gradient: Gradient, size = 512) => {
+  const lut = new Float32Array(size * 3);
+
+  for (let i = 0; i < size; i += 1) {
+    const [r, g, b] = gradient(i / (size - 1)).gl();
+    lut[i * 3] = r;
+    lut[i * 3 + 1] = g;
+    lut[i * 3 + 2] = b;
+  }
+
+  return lut;
+};

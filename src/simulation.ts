@@ -1,43 +1,12 @@
 import { GlParticles, GlParticlesConstructorProps } from "./glParticles";
 import { Renderer } from "./renderer";
 import { getNoiseFn, NoiseFn } from "./noise";
-
-interface PolarCoordinates {
-  theta: number;
-  phi: number;
-}
-
-interface Vector3D {
-  x: number;
-  y: number;
-  z: number;
-}
-
-interface Particle {
-  // Position of the particle in polar coordinates
-  position: PolarCoordinates;
-  // Velocity in local tangent plane (Cartesian coordinates)
-  velocity: Vector3D;
-}
+import rnd from "./random";
 
 const FRICTION = 0.02;
 const NOISE_STRENGTH = 0.01;
-
-const createParticle = () => {
-  // Generate random position on sphere using uniform sampling
-  const theta = Math.random() * 2 * Math.PI;
-  const phi = Math.acos(2 * Math.random() - 1);
-
-  // Generate random velocity in tangent plane
-  const velocityX = Math.random() * 0.01 - 0.005;
-  const velocityY = Math.random() * 0.001 - 0.0005;
-  const velocityZ = Math.random() * 0.001 - 0.0005;
-
-  return {
-    position: { theta, phi },
-    velocity: { x: velocityX, y: velocityY, z: velocityZ },
-  };
-};
+const MIN_VELOCITY = 0.001;
+const LOOP_FREQUENCY = 60; // roughly the same as the music
 
 interface SimulationConstructorProps extends GlParticlesConstructorProps {
   numberOfParticles: number;
@@ -47,18 +16,32 @@ interface SimulationConstructorProps extends GlParticlesConstructorProps {
 /**
  * Class representing a simulation of particles on the surface of a sphere.
  * They move according to their own velocity and a vector field generated with perlin noise.
+ *
+ * Particle state is stored in flat typed arrays (x, y, z triplets) in Cartesian coordinates.
+ * This avoids per-frame object allocations and polar <-> Cartesian conversions, and lets the
+ * position buffer be shared with the GPU geometry without copying.
  */
 export class Simulation {
   private readonly glParticles: GlParticles;
   private readonly sphereRadius: number;
   private readonly vectorField: NoiseFn;
-  particles: Particle[] = [];
+  readonly count: number;
+  // Positions on the sphere surface (Cartesian coordinates)
+  readonly positions: Float32Array;
+  // Velocities in the local tangent plane (Cartesian coordinates)
+  readonly velocities: Float32Array;
 
   constructor(props: SimulationConstructorProps) {
     this.vectorField = getNoiseFn({ resolution: props.noiseResolution });
     this.sphereRadius = props.sphereRadius;
-    this.particles = new Array(props.numberOfParticles).fill(0).map(createParticle);
+    this.count = props.numberOfParticles;
+    this.positions = new Float32Array(this.count * 3);
+    this.velocities = new Float32Array(this.count * 3);
     this.glParticles = new GlParticles(props);
+
+    for (let i = 0; i < this.count; i += 1) {
+      this.spawnParticle(i);
+    }
   }
 
   init() {
@@ -69,99 +52,88 @@ export class Simulation {
     this.glParticles.addToRenderer(renderer);
   }
 
-  fromPolarToCartesian(coords: PolarCoordinates): Vector3D {
-    const x = this.sphereRadius * Math.sin(coords.phi) * Math.cos(coords.theta);
-    const y = this.sphereRadius * Math.sin(coords.phi) * Math.sin(coords.theta);
-    const z = this.sphereRadius * Math.cos(coords.phi);
+  /**
+   * Places the particle at a random position on the sphere (uniform sampling) with a small random velocity.
+   */
+  private spawnParticle(index: number) {
+    const i = index * 3;
+    const theta = rnd.random() * 2 * Math.PI;
+    const phi = Math.acos(2 * rnd.random() - 1);
 
-    return { x, y, z };
-  }
+    this.positions[i] = this.sphereRadius * Math.sin(phi) * Math.cos(theta);
+    this.positions[i + 1] = this.sphereRadius * Math.sin(phi) * Math.sin(theta);
+    this.positions[i + 2] = this.sphereRadius * Math.cos(phi);
 
-  fromCartesianToPolar(cart: { x: number; y: number; z: number }): PolarCoordinates {
-    const r = Math.sqrt(cart.x * cart.x + cart.y * cart.y + cart.z * cart.z);
-
-    return { theta: Math.atan2(cart.y, cart.x), phi: Math.acos(cart.z / r) };
-  }
-
-  getNoise({ position, step }: { position: Vector3D; step: number }) {
-    const loopFrequency = 60; // roughly the same as the music
-
-    if (step % loopFrequency === loopFrequency - 1) {
-      let x: number;
-      let y: number;
-      if (Math.floor(step / loopFrequency) % 2 === 0) {
-        x = Math.random() * 100;
-        y = Math.random() * 100;
-      } else {
-        x = Math.random() * 20 + 50;
-        y = Math.random() * 20 + 50;
-      }
-
-      const threshold = position.x + 3 * Math.cos(position.y / 2);
-      return threshold < -5 ? { x, y } : { x: -x, y: -y };
-    }
-
-    return this.vectorField(position.x, position.y, position.z);
+    this.velocities[i] = rnd.random() * 0.01 - 0.005;
+    this.velocities[i + 1] = rnd.random() * 0.001 - 0.0005;
+    this.velocities[i + 2] = rnd.random() * 0.001 - 0.0005;
   }
 
   update({ deltaTime, step }: { deltaTime: number; step: number }) {
-    this.particles.forEach((particle) => {
-      const cartesianPosition = this.fromPolarToCartesian(particle.position);
+    const { positions, velocities, sphereRadius } = this;
+    const isKickStep = step % LOOP_FREQUENCY === LOOP_FREQUENCY - 1;
+    const isEvenLoop = Math.floor(step / LOOP_FREQUENCY) % 2 === 0;
+    const friction = 1 - FRICTION;
 
-      const noise = this.getNoise({ position: cartesianPosition, step });
+    for (let index = 0; index < this.count; index += 1) {
+      const i = index * 3;
+      let x = positions[i];
+      let y = positions[i + 1];
+      let z = positions[i + 2];
+      let vx = velocities[i];
+      let vy = velocities[i + 1];
+      let vz = velocities[i + 2];
 
-      particle.velocity.x += NOISE_STRENGTH * noise.x * deltaTime;
-      particle.velocity.y += NOISE_STRENGTH * noise.y * deltaTime;
+      let noiseX: number;
+      let noiseY: number;
+      if (isKickStep) {
+        // Once per loop every particle gets a strong push, alternating between two kick patterns
+        noiseX = isEvenLoop ? rnd.random() * 100 : rnd.random() * 20 + 50;
+        noiseY = isEvenLoop ? rnd.random() * 100 : rnd.random() * 20 + 50;
 
-      cartesianPosition.x += particle.velocity.x * deltaTime;
-      cartesianPosition.y += particle.velocity.y * deltaTime;
-      cartesianPosition.z += particle.velocity.z * deltaTime;
+        const threshold = x + 3 * Math.cos(y / 2);
+        if (threshold >= -5) {
+          noiseX = -noiseX;
+          noiseY = -noiseY;
+        }
+      } else {
+        const angle = this.vectorField(x, y, z);
+        noiseX = Math.cos(angle);
+        noiseY = Math.sin(angle);
+      }
 
-      const newRadialDistance = Math.sqrt(
-        cartesianPosition.x ** 2 + cartesianPosition.y ** 2 + cartesianPosition.z ** 2
-      );
+      vx += NOISE_STRENGTH * noiseX * deltaTime;
+      vy += NOISE_STRENGTH * noiseY * deltaTime;
 
-      // Normalize to move it back to the Earth's surface
-      cartesianPosition.x *= this.sphereRadius / newRadialDistance;
-      cartesianPosition.y *= this.sphereRadius / newRadialDistance;
-      cartesianPosition.z *= this.sphereRadius / newRadialDistance;
+      x += vx * deltaTime;
+      y += vy * deltaTime;
+      z += vz * deltaTime;
 
-      // Update the plane's position
-      particle.position = this.fromCartesianToPolar(cartesianPosition);
-
-      // Now also update the velocity vector to reflect it being on the sphere
-      const surfaceNormal = {
-        x: cartesianPosition.x / this.sphereRadius,
-        y: cartesianPosition.y / this.sphereRadius,
-        z: cartesianPosition.z / this.sphereRadius,
-      };
-      const dotProduct =
-        particle.velocity.x * surfaceNormal.x +
-        particle.velocity.y * surfaceNormal.y +
-        particle.velocity.z * surfaceNormal.z;
+      // Normalize to move it back to the sphere surface; the normalized position is also the surface normal
+      const invDistance = 1 / Math.sqrt(x * x + y * y + z * z);
+      const nx = x * invDistance;
+      const ny = y * invDistance;
+      const nz = z * invDistance;
 
       // Subtract the normal component from the current velocity to keep it tangent to the sphere
-      particle.velocity = {
-        x: particle.velocity.x - dotProduct * surfaceNormal.x,
-        y: particle.velocity.y - dotProduct * surfaceNormal.y,
-        z: particle.velocity.z - dotProduct * surfaceNormal.z,
-      };
+      const dotProduct = vx * nx + vy * ny + vz * nz;
+      vx = (vx - dotProduct * nx) * friction;
+      vy = (vy - dotProduct * ny) * friction;
+      vz = (vz - dotProduct * nz) * friction;
 
-      particle.velocity.x *= 1 - FRICTION;
-      particle.velocity.y *= 1 - FRICTION;
-      particle.velocity.z *= 1 - FRICTION;
-
-      const velocityMagnitude = Math.sqrt(
-        particle.velocity.x ** 2 + particle.velocity.y ** 2 + particle.velocity.z ** 2
-      );
-
-      if (velocityMagnitude < 0.001) {
-        const newParticle = createParticle();
-        particle.position = newParticle.position;
-        particle.velocity = newParticle.velocity;
+      if (vx * vx + vy * vy + vz * vz < MIN_VELOCITY * MIN_VELOCITY) {
+        this.spawnParticle(index);
+        continue;
       }
-    });
 
-    this.glParticles.update(this, step);
+      positions[i] = nx * sphereRadius;
+      positions[i + 1] = ny * sphereRadius;
+      positions[i + 2] = nz * sphereRadius;
+      velocities[i] = vx;
+      velocities[i + 1] = vy;
+      velocities[i + 2] = vz;
+    }
+
+    this.glParticles.update(this);
   }
 }

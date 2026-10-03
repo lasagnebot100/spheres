@@ -30,6 +30,35 @@ export class Renderer {
 
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(this.renderer.domElement);
+
+    window.addEventListener("resize", () => this.resize());
+  }
+
+  /**
+   * Adapts the canvas and all perspective cameras to the current window size.
+   */
+  resize() {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+
+    this.renderer.setSize(width, height);
+
+    for (const { camera } of this.renderables) {
+      if (camera instanceof THREE.PerspectiveCamera) {
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+      }
+    }
+  }
+
+  /**
+   * Downloads the current canvas content as PNG.
+   */
+  saveScreenshot(fileName = "spheres.png") {
+    const link = document.createElement("a");
+    link.download = fileName;
+    link.href = this.renderer.domElement.toDataURL("image/png");
+    link.click();
   }
 
   add(renderable: Renderable, { addControls = false } = {}) {

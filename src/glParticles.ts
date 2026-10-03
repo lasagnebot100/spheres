@@ -1,8 +1,7 @@
 import * as THREE from "three";
 import { Simulation } from "./simulation";
-import { getGradient, Gradient } from "./color";
+import { createColorLUT, getGradient, Gradient } from "./color";
 import { Renderer } from "./renderer";
-import chroma from "chroma-js";
 
 const createCamera = () => {
   const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 1, 10000);
@@ -28,6 +27,10 @@ export interface GlParticlesConstructorProps {
   gradient: Gradient;
 }
 
+// Velocity magnitude that maps to the end of the gradient
+const MAX_VELOCITY = 0.4;
+const LUT_SIZE = 4096;
+
 const bGradient = getGradient("ice");
 
 /**
@@ -35,42 +38,33 @@ const bGradient = getGradient("ice");
  * collection of particles in a 3D space, rendered using WebGL.
  */
 export class GlParticles {
-  private readonly sphereRadius: number;
   private readonly particleSize: number;
-  private gradient: Gradient;
+  private readonly colorLUT: Float32Array;
+  private readonly bColorLUT: Float32Array;
   private geometry = new THREE.BufferGeometry();
-  private vertices: number[] = [];
-  private colors: number[] = [];
   private material: THREE.PointsMaterial;
-  private sprite = new THREE.TextureLoader().load("textures/sprites/disc.png");
+  private sprite = new THREE.TextureLoader().load("textures/disc.png");
   private points: THREE.Points;
   camera: THREE.Camera;
   scene: THREE.Scene;
 
-  constructor({ backgroundColor, gradient, sphereRadius, particleSize }: GlParticlesConstructorProps) {
+  constructor({ backgroundColor, gradient, particleSize }: GlParticlesConstructorProps) {
     this.camera = createCamera();
     this.scene = createScene({ backgroundColor });
-    this.gradient = gradient;
+    this.colorLUT = createColorLUT(gradient, LUT_SIZE);
+    this.bColorLUT = createColorLUT(bGradient, LUT_SIZE);
     this.particleSize = particleSize;
-    this.sphereRadius = sphereRadius;
   }
 
   init({ simulation }: { simulation: Simulation }) {
-    simulation.particles.forEach((particle) => {
-      const x = this.sphereRadius * Math.sin(particle.position.phi) * Math.cos(particle.position.theta);
-      const y = this.sphereRadius * Math.sin(particle.position.phi) * Math.sin(particle.position.theta);
-      const z = this.sphereRadius * Math.cos(particle.position.phi);
+    // The simulation's position buffer is shared with the geometry, so no copy is needed on update
+    const positionAttribute = new THREE.BufferAttribute(simulation.positions, 3);
+    positionAttribute.setUsage(THREE.DynamicDrawUsage);
+    const colorAttribute = new THREE.BufferAttribute(new Float32Array(simulation.count * 3), 3);
+    colorAttribute.setUsage(THREE.DynamicDrawUsage);
 
-      this.vertices.push(x, y, z);
-
-      const color = new THREE.Color();
-      color.setHSL(0, 0, 0);
-
-      this.colors.push(color.r, color.g, color.b);
-    });
-
-    this.geometry.setAttribute("position", new THREE.Float32BufferAttribute(this.vertices, 3));
-    this.geometry.setAttribute("color", new THREE.Float32BufferAttribute(this.colors, 3));
+    this.geometry.setAttribute("position", positionAttribute);
+    this.geometry.setAttribute("color", colorAttribute);
 
     this.material = new THREE.PointsMaterial({
       size: this.particleSize,
@@ -79,6 +73,8 @@ export class GlParticles {
     });
 
     this.points = new THREE.Points(this.geometry, this.material);
+    // Particles always cover the whole sphere, so there is no need to compute bounding volumes for culling
+    this.points.frustumCulled = false;
     this.scene.add(this.points);
   }
 
@@ -86,49 +82,39 @@ export class GlParticles {
     renderer.add({ scene: this.scene, camera: this.camera }, { addControls: true });
   }
 
-  update(simulation: Simulation, step: number) {
-    const positions = this.points.geometry.attributes.position.array;
-    const colors = this.points.geometry.attributes.color.array;
+  update(simulation: Simulation) {
+    const { positions, velocities } = simulation;
+    const colors = this.geometry.attributes.color.array as Float32Array;
+    const { colorLUT, bColorLUT } = this;
+    const maxLutIndex = LUT_SIZE - 1;
 
-    simulation.particles.forEach((particle, index) => {
-      positions[index * 3] = this.sphereRadius * Math.sin(particle.position.phi) * Math.cos(particle.position.theta);
-      positions[index * 3 + 1] =
-        this.sphereRadius * Math.sin(particle.position.phi) * Math.sin(particle.position.theta);
-      positions[index * 3 + 2] = this.sphereRadius * Math.cos(particle.position.phi);
+    for (let index = 0; index < simulation.count; index += 1) {
+      const i = index * 3;
+      const vx = velocities[i];
+      const vy = velocities[i + 1];
+      const vz = velocities[i + 2];
 
-      // Map the speed to a color (red-ish for higher speeds)
-      const velocityMagnitude = Math.sqrt(
-        particle.velocity.x * particle.velocity.x +
-          particle.velocity.y * particle.velocity.y +
-          particle.velocity.z * particle.velocity.z
-      );
-      const color = this.gradient(velocityMagnitude / 0.4).gl();
-      const bColor = bGradient(velocityMagnitude / 0.4).gl();
+      // Map the speed to a gradient position (clamped to [0, 1]) and interpolate between neighbouring LUT entries
+      const lutPosition = Math.min(Math.sqrt(vx * vx + vy * vy + vz * vz) / MAX_VELOCITY, 1) * maxLutIndex;
+      const lutIndex = Math.min(Math.floor(lutPosition), maxLutIndex - 1);
+      const fraction = lutPosition - lutIndex;
+      const l0 = lutIndex * 3;
+      const l1 = l0 + 3;
 
-      const x = positions[index * 3];
-      const y = positions[index * 3 + 1];
-      const z = positions[index * 3 + 2];
+      // Blend between both gradients along a wavy band across the sphere
+      const threshold = positions[i] + 3 * Math.cos(positions[i + 1] / 2);
+      // Weight of the second gradient: 0 below -10, 1 from 0 upwards
+      const mix = threshold < -10 ? 0 : threshold < 0 ? (threshold + 10) / 10 : 1;
 
-      const threshold = x + 3 * Math.cos(y / 2);
-      if (threshold < -10) {
-        colors[index * 3] = color[0];
-        colors[index * 3 + 1] = color[1];
-        colors[index * 3 + 2] = color[2];
-      } else if (threshold < 0) {
-        const mixColor = chroma
-          .mix(this.gradient(velocityMagnitude / 0.4), bGradient(velocityMagnitude / 0.4), (threshold + 10) / 10)
-          .gl();
-        colors[index * 3] = mixColor[0];
-        colors[index * 3 + 1] = mixColor[1];
-        colors[index * 3 + 2] = mixColor[2];
-      } else {
-        colors[index * 3] = bColor[0];
-        colors[index * 3 + 1] = bColor[1];
-        colors[index * 3 + 2] = bColor[2];
+      for (let c = 0; c < 3; c += 1) {
+        const a = colorLUT[l0 + c] + (colorLUT[l1 + c] - colorLUT[l0 + c]) * fraction;
+        const b = bColorLUT[l0 + c] + (bColorLUT[l1 + c] - bColorLUT[l0 + c]) * fraction;
+        // Same as chroma.mix in its default "lrgb" mode
+        colors[i + c] = mix === 0 ? a : mix === 1 ? b : Math.sqrt(a * a * (1 - mix) + b * b * mix);
       }
-    });
+    }
 
-    this.points.geometry.attributes.position.needsUpdate = true;
-    this.points.geometry.attributes.color.needsUpdate = true;
+    this.geometry.attributes.position.needsUpdate = true;
+    this.geometry.attributes.color.needsUpdate = true;
   }
 }
