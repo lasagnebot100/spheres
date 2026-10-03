@@ -24,7 +24,8 @@ interface SimulationConstructorProps extends GlParticlesConstructorProps {
 export class Simulation {
   private readonly glParticles: GlParticles;
   private readonly sphereRadius: number;
-  private readonly vectorField: NoiseFn;
+  private readonly noiseResolution: number;
+  private vectorField: NoiseFn;
   readonly count: number;
   // Positions on the sphere surface (Cartesian coordinates)
   readonly positions: Float32Array;
@@ -32,6 +33,7 @@ export class Simulation {
   readonly velocities: Float32Array;
 
   constructor(props: SimulationConstructorProps) {
+    this.noiseResolution = props.noiseResolution;
     this.vectorField = getNoiseFn({ resolution: props.noiseResolution });
     this.sphereRadius = props.sphereRadius;
     this.count = props.numberOfParticles;
@@ -50,6 +52,18 @@ export class Simulation {
 
   addToRenderer(renderer: Renderer) {
     this.glParticles.addToRenderer(renderer);
+  }
+
+  /**
+   * Restarts the simulation with a new vector field and freshly spawned particles, based on the current seed.
+   * Uses the same order of random draws as the constructor, so a reset reproduces a fresh start with that seed.
+   */
+  reset() {
+    this.vectorField = getNoiseFn({ resolution: this.noiseResolution });
+
+    for (let i = 0; i < this.count; i += 1) {
+      this.spawnParticle(i);
+    }
   }
 
   /**

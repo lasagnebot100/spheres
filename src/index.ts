@@ -9,6 +9,20 @@ const DEFAULT_PARTICLES = 100000;
 const MAX_PARTICLES = 1000000;
 
 /**
+ * Writes the current seed to the URL so the render can be reproduced or shared.
+ * Some embedding contexts (e.g. sandboxed frames) don't allow this, which is fine to ignore.
+ */
+const writeSeedToUrl = () => {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    params.set("seed", rnd.getSeed());
+    window.history.replaceState(null, "", `?${params}`);
+  } catch {
+    // The render still works, it just can't be shared via URL
+  }
+};
+
+/**
  * Reads the render settings from the URL, e.g. `?seed=1234&palette=ice&particles=50000`.
  * The seed is written back to the URL so the current render can be reproduced or shared.
  */
@@ -19,8 +33,7 @@ const readSettings = () => {
   if (seed) {
     rnd.setSeed(seed);
   } else {
-    params.set("seed", rnd.getSeed());
-    window.history.replaceState(null, "", `?${params}`);
+    writeSeedToUrl();
   }
 
   const palette = params.get("palette") ?? DEFAULT_PALETTE;
@@ -78,12 +91,14 @@ const main = () => {
       case "s":
         renderer.saveScreenshot(`spheres-${rnd.getSeed()}-${step}.png`);
         break;
-      case "n": {
-        const params = new URLSearchParams(window.location.search);
-        params.delete("seed");
-        window.location.search = `${params}`;
+      case "n":
+        // Restart in place instead of reloading, so it also works where the page can't navigate
+        rnd.newSeed();
+        writeSeedToUrl();
+        simulation.reset();
+        step = 0;
+        paused = false;
         break;
-      }
     }
   });
 };
